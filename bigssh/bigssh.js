@@ -30,246 +30,247 @@
  *
  **/
 
-module.exports = function(RED) {
+module.exports = function (RED) {
 
-    "use strict";
+  "use strict";
 
-    var biglib = require('node-red-biglib');
-    var stream = require('stream');
+  var biglib = require('node-red-biglib');
+  var stream = require('stream');
+  var ssh2 = require('ssh2')
 
-    function SSH_Node(n) {
+  function SSH_Node(n) {
 
-      RED.nodes.createNode(this, n);
+    RED.nodes.createNode(this, n);
 
-      this.host = n.host;
-      this.port = n.port;
-      this.label = '';
-      this.userlabel = n.userlabel;
+    this.host = n.host;
+    this.port = n.port;
+    this.label = '';
+    this.userlabel = n.userlabel;
 
-      var ssh_config = {
-        host: this.host,
-        port: this.port,
-        username: this.credentials.username,
-        password: this.credentials.password,
-        privateKey: undefined,
-        privateKeyFile: this.credentials.privateKey,
-        passphrase: this.credentials.passphrase,
-        algorithms: {}
+    var ssh_config = {
+      host: this.host,
+      port: this.port,
+      username: this.credentials.username,
+      password: this.credentials.password,
+      privateKey: undefined,
+      privateKeyFile: this.credentials.privateKey,
+      passphrase: this.credentials.passphrase,
+      algorithms: {}
+    }
+
+    if (this.credentials.algorithms) ssh_config.algorithms.kex = [this.credentials.algorithms];
+    if (this.credentials.ciphers) ssh_config.algorithms.cipher = [this.credentials.ciphers];
+    if (this.credentials.serverHostKey) ssh_config.algorithms.serverHostKey = [this.credentials.serverHostKey];
+    if (this.credentials.hmac) ssh_config.algorithms.hmac = [this.credentials.hmac];
+    if (this.credentials.compress) ssh_config.compress.compress = [this.credentials.compress];
+
+    //
+    // In order to make this an instance while the object is common, it must not have any access to this.
+    // execute must be called in the context of the node using these credentials
+    //
+    this.execute = function (my_config) {
+
+      // This dummy writable is used when the command does not need any data on its stdin
+      // If any data is coming, this stream drops it and no "EPIPE error" is thrown
+      var dummy = biglib.dummy_writable(my_config.noStdin);
+
+      // Choice was made to read the keyfile at each run in order to make it possible to correct a configuration
+      // without restarting
+      if (ssh_config.privateKeyFile != undefined) {
+        try {
+          ssh_config.privateKey = require('fs').readFileSync(ssh_config.privateKeyFile);
+        } catch (err) {
+          throw new Error("Private Key: " + err.Message);
+        }
       }
 
-      if (this.credentials.algorithms) ssh_config.algorithms.kex = [ this.credentials.algorithms ];
-      if (this.credentials.ciphers) ssh_config.algorithms.cipher = [ this.credentials.ciphers ];
-      if (this.credentials.serverHostKey) ssh_config.algorithms.serverHostKey = [ this.credentials.serverHostKey ];
-      if (this.credentials.hmac) ssh_config.algorithms.hmac = [ this.credentials.hmac ];
-      if (this.credentials.compress) ssh_config.compress.compress = [ this.credentials.compress ];
+      // Create 3 passthrough in order to return a full set of streams far before they are really connected to a valid ssh remote command
+      //var stdin  = new stream.PassThrough({ objectMode: true }); // acts as a buffer while ssh is connecting
 
-      //
-      // In order to make this an instance while the object is common, it must not have any access to this.
-      // execute must be called in the context of the node using these credentials
-      //
-      this.execute = function(my_config) {
+      // This to avoid "invalid chunk data" when payload is not a string
+      var stdin = biglib.stringify_stream();
 
-        // This dummy writable is used when the command does not need any data on its stdin
-        // If any data is coming, this stream drops it and no "EPIPE error" is thrown
-        var dummy = biglib.dummy_writable(my_config.noStdin);   
+      var stdout = new stream.PassThrough({ objectMode: true });
 
-        // Choice was made to read the keyfile at each run in order to make it possible to correct a configuration
-        // without restarting
-        if (ssh_config.privateKeyFile != undefined) {
-          try {
-            ssh_config.privateKey = require('fs').readFileSync(ssh_config.privateKeyFile);
-          } catch (err) {
-            throw new Error("Private Key: " + err.Message);
-          }
+      // Consider output as. This is used when the remote command sends data in another encoding than utf8
+      if (my_config.format) child.stdout.setEncoding(format);
+
+      // Magic library to mix a Writable and a Readable stream into a Transform
+      var ret = require('event-stream').duplex(my_config.noStdin ? dummy : stdin, stdout);
+
+      // Not a good idea at all ! If done, ssh is blocking its output at about 1 Mb of data!
+      //if (my_config.noStdin) stdin.end();
+
+      var stderr = new stream.PassThrough({ objectMode: true });
+
+      // the others property is known by biglib and used to send extra streams to extra outputs
+      ret.others = [stderr];
+
+      // Here it is, the job is starting now
+      var conn = new ssh2.Client();
+
+      // It's now possible to override the host using msg.config.host
+      if (my_config.host) { ssh_config.host = my_config.host }
+
+      // this means "biglib"
+      this.working("Connecting to " + ssh_config.host + "...");
+
+      conn.on('ready', function () {
+
+        // If commandArgs2 is json type, command is a template string
+        var commandLine;
+        if (typeof my_config.commandArgs2 != "string") {
+          commandLine = (function (cmd, payload) { return eval('`' + cmd + '`') })(my_config.commandLine + ' ' + biglib.argument_to_string(my_config.commandArgs), my_config.commandArgs2 || [])
+        } else {
+          commandLine = my_config.commandLine + ' ' + biglib.argument_to_string(my_config.commandArgs.concat(biglib.argument_to_array(my_config.commandArgs2) || []));
         }
 
-        // Create 3 passthrough in order to return a full set of streams far before they are really connected to a valid ssh remote command
-        //var stdin  = new stream.PassThrough({ objectMode: true }); // acts as a buffer while ssh is connecting
+        // this means "biglib" instance. Substr is to avoid a text too long
+        this.working("Executing " + commandLine.substr(0, 20) + "...");
 
-        // This to avoid "invalid chunk data" when payload is not a string
-        var stdin = biglib.stringify_stream();
+        conn.exec(commandLine, function (err, stream) {
+          if (err) return ret.emit('error', err);
 
-        var stdout = new stream.PassThrough({ objectMode: true });
+          this.working('Launched, waiting for data...');
 
-        // Consider output as. This is used when the remote command sends data in another encoding than utf8
-        if (my_config.format) child.stdout.setEncoding(format);
+          stream
+            .on('close', function (code, signal) {
 
-        // Magic library to mix a Writable and a Readable stream into a Transform
-        var ret = require('event-stream').duplex(my_config.noStdin ? dummy : stdin, stdout);
+              // Gives biglib extra informations using the "stats" function                        
+              this.stats({ rc: code, signal: signal });
+              ret.emit('my_finish');
 
-        // Not a good idea at all ! If done, ssh is blocking its output at about 1 Mb of data!
-        //if (my_config.noStdin) stdin.end();
+              conn.end();
 
-        var stderr = new stream.PassThrough({ objectMode: true });
+            }.bind(this))
+            .on('error', function (err) {
+              ret.emit('error', err);
 
-        // the others property is known by biglib and used to send extra streams to extra outputs
-        ret.others = [ stderr ];
+              conn.end();
+            })
 
-        // Here it is, the job is starting now
-        var conn = new require('ssh2').Client();
+          // SSH stream is available, connect the bufstream
+          stdin.pipe(stream).pipe(stdout);
 
-        // It's now possible to override the host using msg.config.host
-        if (my_config.host) { ssh_config.host = my_config.host }
+          // Also connect the ssh stderr stream to the pre allocated stderr 
+          stream.stderr.pipe(stderr);
 
-        // this means "biglib"
-        this.working("Connecting to " + ssh_config.host + "...");
+        }.bind(this));
 
-        conn.on('ready', function() {
-
-          // If commandArgs2 is json type, command is a template string
-          var commandLine;
-          if (typeof my_config.commandArgs2 != "string") {
-            commandLine = (function(cmd, payload) { return eval('`'+cmd+'`') })(my_config.commandLine + ' ' + biglib.argument_to_string(my_config.commandArgs), my_config.commandArgs2||[])
-          } else {
-            commandLine = my_config.commandLine + ' ' + biglib.argument_to_string(my_config.commandArgs.concat(biglib.argument_to_array(my_config.commandArgs2)||[]));
-          }
-
-          // this means "biglib" instance. Substr is to avoid a text too long
-          this.working("Executing " + commandLine.substr(0,20) + "...");
-
-          conn.exec(commandLine, function(err, stream) {
-            if (err) return ret.emit('error', err);
-
-            this.working('Launched, waiting for data...');
-
-            stream
-              .on('close', function(code, signal) {  
-
-                // Gives biglib extra informations using the "stats" function                        
-                this.stats({ rc: code, signal: signal }); 
-                ret.emit('my_finish');    
-
-                conn.end();
-
-              }.bind(this))
-              .on('error', function(err) {
-                ret.emit('error', err);
-
-                conn.end();
-              })
-
-            // SSH stream is available, connect the bufstream
-            stdin.pipe(stream).pipe(stdout);
-
-            // Also connect the ssh stderr stream to the pre allocated stderr 
-            stream.stderr.pipe(stderr);
-
-          }.bind(this));      
-
-        }.bind(this))
-        .on('error', function(err) {
+      }.bind(this))
+        .on('error', function (err) {
           ret.emit('error', err);
         })
         .connect(ssh_config)
 
-        return ret;
-      }
-
+      return ret;
     }
 
-    RED.nodes.registerType("SSH_Credentials", SSH_Node, {
-      credentials: {
-        username: { type: "text" },
-        password: { type: "password" },
-        privateKey: { type: "text" },
-        passphrase: { type: "password" },
-        algorithms: { type: "text" },
-        ciphers: { type: "text" },
-        serverHostKey: { type: "text" },
-        hmac: { type: "text" },
-        compress: { type: "text" }
-      }
-    });      
+  }
 
-    // The options the spawner will understand
-    var ssh_options = {
-      "commandLine": "",
-      "commandArgs": { value: "", validation: biglib.argument_to_array },     // Arguments from the configuration box
-      "commandArgs2": { value: ""                                      },     // Payload as additional arguments if required
-      "minWarning": 1,                                                        // The min return code the node will consider it is a warning
-      "minError": 8,                                                          // The min return code the node will consider it is as an error
-      "noStdin": false,                                                       // Command does require an input (used to avoid EPIPE error)                                   
-      "host": ""                                                              // Now it's possible to override the host using msg.config.host
-    }    
+  RED.nodes.registerType("SSH_Credentials", SSH_Node, {
+    credentials: {
+      username: { type: "text" },
+      password: { type: "password" },
+      privateKey: { type: "text" },
+      passphrase: { type: "password" },
+      algorithms: { type: "text" },
+      ciphers: { type: "text" },
+      serverHostKey: { type: "text" },
+      hmac: { type: "text" },
+      compress: { type: "text" }
+    }
+  });
 
-    function BigSSH(config) {
+  // The options the spawner will understand
+  var ssh_options = {
+    "commandLine": "",
+    "commandArgs": { value: "", validation: biglib.argument_to_array },     // Arguments from the configuration box
+    "commandArgs2": { value: "" },     // Payload as additional arguments if required
+    "minWarning": 1,                                                        // The min return code the node will consider it is a warning
+    "minError": 8,                                                          // The min return code the node will consider it is as an error
+    "noStdin": false,                                                       // Command does require an input (used to avoid EPIPE error)                                   
+    "host": ""                                                              // Now it's possible to override the host using msg.config.host
+  }
 
-      RED.nodes.createNode(this, config);
-      this.myssh = config.myssh;
+  function BigSSH(config) {
 
-      var crednode = RED.nodes.getNode(config.myssh);
+    RED.nodes.createNode(this, config);
+    this.myssh = config.myssh;
 
-      // Custom progress function
-      var progress = function(running) { return running ? "running for " + this.duration() : ("done with rc " + (this._runtime_control.rc != undefined ? this._runtime_control.rc : "?")) }
+    var crednode = RED.nodes.getNode(config.myssh);
 
-      // new instance of biglib for this configuration
-      var bignode = new biglib({ 
-        config: config, node: this,   // biglib needs to know the node configuration and the node itself (for statuses and sends)
-        status: progress,             // define the kind of informations displayed while running
-        parser_config: ssh_options,   // the parser configuration (ie the known options the parser will understand)
-        parser: crednode.execute,     // the parser (ie the remote command)
-        on_finish: biglib.min_finish, // custom "on_finish" handler. Used to capture the return code
-        finish_event: 'my_finish',    // custom finish event to listen to. The end won't be the "close" event of the stream but the result of the custom "on_finish" handler
-        generator: 'limiter'          // acts as a generator as it's not a real filter. If multiple payloads arrive, without this, will fork as many ssh as incoming messages!
-      });
+    // Custom progress function
+    var progress = function (running) { return running ? "running for " + this.duration() : ("done with rc " + (this._runtime_control.rc != undefined ? this._runtime_control.rc : "?")) }
 
-      // biglib changes the configuration to add some properties
-      config = bignode.config();
+    // new instance of biglib for this configuration
+    var bignode = new biglib({
+      config: config, node: this,   // biglib needs to know the node configuration and the node itself (for statuses and sends)
+      status: progress,             // define the kind of informations displayed while running
+      parser_config: ssh_options,   // the parser configuration (ie the known options the parser will understand)
+      parser: crednode.execute,     // the parser (ie the remote command)
+      on_finish: biglib.min_finish, // custom "on_finish" handler. Used to capture the return code
+      finish_event: 'my_finish',    // custom finish event to listen to. The end won't be the "close" event of the stream but the result of the custom "on_finish" handler
+      generator: 'limiter'          // acts as a generator as it's not a real filter. If multiple payloads arrive, without this, will fork as many ssh as incoming messages!
+    });
 
-      this.on('input', function(msg) {
-        
-        if (msg && msg.config && msg.config.uhcred) {
+    // biglib changes the configuration to add some properties
+    config = bignode.config();
 
-          this.new_ssh_credentials = undefined;
+    this.on('input', function (msg) {
 
-          var myf = (function(node) {
-            if (node.type == "SSH_Credentials") {
-              if (node.userlabel == msg.config.uhcred) {
-                this.new_ssh_credentials = RED.nodes.getNode(node.id);
-              }
+      if (msg && msg.config && msg.config.uhcred) {
+
+        this.new_ssh_credentials = undefined;
+
+        var myf = (function (node) {
+          if (node.type == "SSH_Credentials") {
+            if (node.userlabel == msg.config.uhcred) {
+              this.new_ssh_credentials = RED.nodes.getNode(node.id);
             }
-          }).bind(this);
-          RED.nodes.eachNode(myf);
-
-          if (this.new_ssh_credentials) {
-            //console.log("Settings credentials to " + this.new_ssh_credentials.userlabel);
-            config.myssh = this.new_ssh_credentials.id;
-
-            this.myssh = config.myssh.id
-              
-            crednode = this.new_ssh_credentials;
-
-            bignode = new biglib({ 
-              config: config, node: this,   // biglib needs to know the node configuration and the node itself (for statuses and sends)
-              status: progress,             // define the kind of informations displayed while running
-              parser_config: ssh_options,   // the parser configuration (ie the known options the parser will understand)
-              parser: crednode.execute,     // the parser (ie the remote command)
-              on_finish: biglib.min_finish, // custom "on_finish" handler. Used to capture the return code
-              finish_event: 'my_finish',    // custom finish event to listen to. The end won't be the "close" event of the stream but the result of the custom "on_finish" handler
-              generator: 'limiter'          // acts as a generator as it's not a real filter. If multiple payloads arrive, without this, will fork as many ssh as incoming messages!
-            });
-
-            config = bignode.config();
-          } else {
-            bignode._on_finish({ "message": "Unavailable configuration for uhcred " + msg.config.uhcred});
-            return;
           }
+        }).bind(this);
+        RED.nodes.eachNode(myf);
+
+        if (this.new_ssh_credentials) {
+          //console.log("Settings credentials to " + this.new_ssh_credentials.userlabel);
+          config.myssh = this.new_ssh_credentials.id;
+
+          this.myssh = config.myssh.id
+
+          crednode = this.new_ssh_credentials;
+
+          bignode = new biglib({
+            config: config, node: this,   // biglib needs to know the node configuration and the node itself (for statuses and sends)
+            status: progress,             // define the kind of informations displayed while running
+            parser_config: ssh_options,   // the parser configuration (ie the known options the parser will understand)
+            parser: crednode.execute,     // the parser (ie the remote command)
+            on_finish: biglib.min_finish, // custom "on_finish" handler. Used to capture the return code
+            finish_event: 'my_finish',    // custom finish event to listen to. The end won't be the "close" event of the stream but the result of the custom "on_finish" handler
+            generator: 'limiter'          // acts as a generator as it's not a real filter. If multiple payloads arrive, without this, will fork as many ssh as incoming messages!
+          });
+
+          config = bignode.config();
+        } else {
+          bignode._on_finish({ "message": "Unavailable configuration for uhcred " + msg.config.uhcred });
+          return;
         }
+      }
 
-        // Is payload an extra argument
-        delete config.commandArgs2;
-        if (config.payloadIsArg && msg.payload) {
-          msg.config = msg.config || {};
-          msg.config.commandArgs2 = msg.payload;
+      // Is payload an extra argument
+      delete config.commandArgs2;
+      if (config.payloadIsArg && msg.payload) {
+        msg.config = msg.config || {};
+        msg.config.commandArgs2 = msg.payload;
 
-          // if not, the size_stream which streams to the command will throw EPIPE
-          delete msg.payload;
-        }
+        // if not, the size_stream which streams to the command will throw EPIPE
+        delete msg.payload;
+      }
 
-        bignode.main.call(bignode, msg);
-      })
-    }  
+      bignode.main.call(bignode, msg);
+    })
+  }
 
-    RED.nodes.registerType("bigssh", BigSSH);
+  RED.nodes.registerType("bigssh", BigSSH);
 
 }
